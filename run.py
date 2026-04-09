@@ -78,6 +78,46 @@ def derive_title(text: str, date: datetime) -> str:
     return date.strftime('%H-%M')
 
 
+def extract_heading(text: str) -> str | None:
+    """Returns the text of the first markdown heading, or None if there is none."""
+    for line in text.splitlines():
+        m = re.match(r'^#{1,6}\s+(.+)', line.strip())
+        if m:
+            heading = m.group(1).strip()
+            heading = re.sub(r'\*+', '', heading)       # strip bold/italic markers
+            heading = re.sub(r'`', '', heading)          # strip inline code markers
+            heading = heading.strip()
+            return heading if heading else None
+    return None
+
+
+def extract_summary(text: str, max_len: int = 160) -> str | None:
+    """Returns a clean plain-text summary of up to max_len characters."""
+    clean = text
+    clean = re.sub(r'^#{1,6}\s+.*$', '', clean, flags=re.MULTILINE)  # remove headings
+    clean = re.sub(r'!\[.*?\]\(.*?\)', '', clean)                      # remove images
+    clean = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', clean)           # links → text
+    clean = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', clean)           # bold/italic
+    clean = re.sub(r'`[^`]+`', '', clean)                             # inline code
+    clean = re.sub(r'<!--.*?-->', '', clean, flags=re.DOTALL)         # comments
+    clean = re.sub(r'\n+', ' ', clean)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    if not clean:
+        return None
+    if len(clean) > max_len:
+        cut = clean[:max_len]
+        # avoid cutting mid-word
+        space = cut.rfind(' ')
+        clean = cut[:space] if space > max_len // 2 else cut
+    return clean
+
+
+def extract_first_image(body: str) -> str | None:
+    """Returns the src of the first markdown image in the (processed) body."""
+    m = re.search(r'!\[.*?\]\((.+?)\)', body)
+    return m.group(1) if m else None
+
+
 def apply_path_template(template: str, date: datetime) -> Path:
     """Replaces Obsidian-style date tokens in a path template string."""
     r = template
@@ -196,7 +236,18 @@ def load_journals_and_attachments(conn) -> tuple[dict, dict]:
 
 
 def load_tags(conn) -> dict[int, list[str]]:
-    """Discovers the Core Data junction table and returns {entry_pk: [tag, ...]}."""
+    """
+    Returns {entry_pk: [tag_name, ...]} by locating the Core Data junction table
+    that links ZENTRY to ZTAG.
+
+    Strategy:
+    1. Try every table whose name starts with 'Z_' (Core Data junction tables).
+    2. Inspect column names for one referencing entries and one referencing tags.
+    3. Use the ORIGINAL (non-uppercased) column names in the SQL query so SQLite
+       can resolve them regardless of case sensitivity.
+    4. Collect results from ALL matching tables (not just the first) to handle
+       databases where tags are spread across multiple junction tables.
+    """
     result: dict[int, list[str]] = defaultdict(list)
 
     all_tables = [r[0] for r in conn.execute(
@@ -206,24 +257,31 @@ def load_tags(conn) -> dict[int, list[str]]:
         return dict(result)
 
     for table in all_tables:
-        # Core Data junction tables are named Z_<N> or Z_<N><ENTITY>
-        if not re.match(r'^Z_\d', table):
+        if not table.upper().startswith('Z_'):
             continue
         try:
-            cols = [c[1].upper() for c in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
-            entry_col = next((c for c in cols if 'ENTR' in c), None)
-            tag_col   = next((c for c in cols if 'TAG'  in c), None)
-            if not entry_col or not tag_col:
+            # Keep ORIGINAL column names for the SQL query (SQLite is case-insensitive
+            # for identifiers, but using the exact name avoids any edge cases).
+            col_rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            orig_names = [c[1] for c in col_rows]           # original case
+            upper_names = [n.upper() for n in orig_names]   # for pattern matching
+
+            entry_idx = next((i for i, n in enumerate(upper_names) if 'ENTR' in n), None)
+            tag_idx   = next((i for i, n in enumerate(upper_names) if 'TAG'  in n), None)
+            if entry_idx is None or tag_idx is None:
                 continue
+
+            entry_col = orig_names[entry_idx]
+            tag_col   = orig_names[tag_idx]
+
             rows = conn.execute(
                 f'SELECT j."{entry_col}", t.ZNAME '
                 f'FROM "{table}" j JOIN ZTAG t ON t.Z_PK = j."{tag_col}" '
                 f'WHERE j."{entry_col}" IS NOT NULL AND t.ZNAME IS NOT NULL'
             ).fetchall()
             for entry_pk, tag_name in rows:
-                result[entry_pk].append(tag_name)
-            if result:
-                break   # found the right table
+                if tag_name not in result[entry_pk]:
+                    result[entry_pk].append(tag_name)
         except Exception:
             continue
 
@@ -280,13 +338,17 @@ def build_entry_frontmatter(
     uuid: str,
     tags: list[str],
     location: dict | None,
+    heading: str | None = None,
+    summary: str | None = None,
+    first_image: str | None = None,
 ) -> dict:
     """Builds the frontmatter property dict for a single entry."""
     props: dict = {
         'date':        date.strftime('%Y-%m-%d'),
         'time':        date.strftime('%H:%M'),
         'created':     date.isoformat(),
-        'title':       title,
+        # title: prefer the actual heading; fall back to the filename-derived title
+        'title':       heading if heading else title,
         'starred':     starred,
         'uuid':        uuid,
         # "On This Day" helpers (usable with Obsidian Bases / Cards view)
@@ -309,6 +371,10 @@ def build_entry_frontmatter(
         place = ', '.join(p for p in parts if p)
         if place:
             props['place'] = place
+    if summary:
+        props['summary'] = summary
+    if first_image:
+        props['first_image'] = first_image
     return props
 
 
@@ -350,15 +416,37 @@ def merge_entry_frontmatters(fms: list[dict], level: str) -> dict:
                 merged['place'] = fm['place']
             break
 
+    # Single-entry fields: carry through when there is exactly one entry,
+    # or pick the first available value for multi-entry merged files.
+    for key in ('title', 'summary', 'first_image'):
+        for fm in fms:
+            if fm.get(key):
+                merged[key] = fm[key]
+                break
+
+    # uuid / time / created: only meaningful for single-entry files
+    if len(fms) == 1:
+        for key in ('uuid', 'time', 'created'):
+            if fms[0].get(key):
+                merged[key] = fms[0][key]
+
     return merged
+
+
+def _yaml_str(value: str) -> str:
+    """
+    Serialises a string as a safe YAML scalar.
+    Uses single-quoted style: the only escape needed is ' → ''.
+    Plain (unquoted) style is used only for simple alphanumeric-ish values.
+    """
+    _PLAIN_RE = re.compile(r'^[A-Za-z0-9_\-./]+$')
+    if _PLAIN_RE.match(value):
+        return value                          # no quoting needed
+    return "'" + value.replace("'", "''") + "'"
 
 
 def frontmatter_to_yaml(props: dict) -> str:
     """Serialises a property dict to a YAML frontmatter block (--- … ---)."""
-    def _needs_quote(s: str) -> bool:
-        return (not s or s[0] in ('"', "'", '-', '?', '{', '[', '|', '>')
-                or any(c in s for c in ':#{}[]|>&!'))
-
     lines = ['---']
     for k, v in props.items():
         if v is None:
@@ -375,12 +463,10 @@ def frontmatter_to_yaml(props: dict) -> str:
                 # Block array
                 lines.append(f'{k}:')
                 for item in v:
-                    if isinstance(item, str) and _needs_quote(item):
-                        lines.append(f'  - "{item}"')
-                    else:
-                        lines.append(f'  - {item}')
+                    scalar = _yaml_str(item) if isinstance(item, str) else str(item)
+                    lines.append(f'  - {scalar}')
         elif isinstance(v, str):
-            lines.append(f'{k}: "{v}"' if _needs_quote(v) else f'{k}: {v}')
+            lines.append(f'{k}: {_yaml_str(v)}')
         else:
             lines.append(f'{k}: {v}')
     lines.append('---')
@@ -413,9 +499,15 @@ def process_entry(
     uuid    = entry_row['ZUUID'] or ''
     starred = bool(entry_row['ZSTARRED'])
 
-    title = derive_title(text, date)
-    body  = resolve_attachments(text, att_list, assets_dir)
-    fm    = build_entry_frontmatter(date, title, starred, uuid, tags, location)
+    title       = derive_title(text, date)
+    heading     = extract_heading(text)
+    summary     = extract_summary(text)
+    body        = resolve_attachments(text, att_list, assets_dir)
+    first_image = extract_first_image(body)
+    fm          = build_entry_frontmatter(
+        date, title, starred, uuid, tags, location,
+        heading=heading, summary=summary, first_image=first_image,
+    )
 
     return EntryData(date=date, title=title, body=body, fm=fm)
 

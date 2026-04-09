@@ -132,16 +132,50 @@ Each entry within the merged file gets its own `## HH:MM – Title` heading, sep
 
 ## Obsidian integration
 
+<img width="3230" height="2200" alt="image" src="https://github.com/user-attachments/assets/ad39a279-2bd4-47e1-bbe3-b2f115b266a5" />
+
+with all values as properties:
+
+<img width="815" height="708" alt="image" src="https://github.com/user-attachments/assets/804fbe18-6992-42b5-a3fa-51dc5986ee7d" />
+
+
 ### Map view
 
 The `location: [lat, lng]` property is recognised by Obsidian's built-in Map view out of the box.
+
+## Daily Note Plugin support
+
+<img width="654" height="590" alt="image" src="https://github.com/user-attachments/assets/7ec34013-c588-4553-a2f0-ed9c8ef58c52" />
+
+
 
 ### "On This Day" (Cards view)
 
 Use `month_day` (e.g. `01-15`) to filter entries from the same calendar day across different years:
 
 ```text
-WHERE month_day = "01-15"
+formulas:
+  on_this_day: |
+    if(date(now()).month == date(file.name).month,
+      if(date(now()).day == date(file.name).day,
+        "true",
+        "false"),
+      "false")
+views:
+  - type: cards
+    name: On This Day
+    filters:
+      and:
+        - formula.on_this_day.contains("true")
+    order:
+      - file.name
+      - title
+      - summary
+      - first_image
+    sort:
+      - property: file.name
+        direction: DESC
+
 ```
 
 Combine with the Cards view to build an "On This Day" board.
